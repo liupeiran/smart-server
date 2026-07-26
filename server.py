@@ -1,5 +1,6 @@
 import random
 import string
+import hashlib
 from urllib.parse import urlsplit, urlunsplit
 
 import uvicorn
@@ -12,6 +13,10 @@ app = FastAPI(
     title="URL Shortener",
     description="A MVP evolving URL shortener system"
 )
+
+STRATEGY = "COUNTER"
+GLOBAL_COUNTER = 62**6
+BASE62_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 # In-memory database
 url_db = {}
@@ -34,7 +39,7 @@ class ShortenResponse(BaseModel):
 
 @app.exception_handler(RequestValidationError)
 async def invalid_request_handler(
-    request: Request, exc: RequestValidationError
+    _: Request, _exc: RequestValidationError
 ) -> JSONResponse:
     return JSONResponse(status_code=400, content={"detail": "Invalid request"})
 
@@ -71,11 +76,49 @@ def normalize_url(url: str) -> str:
         )
     )
 
-
-def generate_short_code(length: int = 7) -> str:
+def generate_random_code(length: int = 7) -> str:
     """Generate a random alphanumeric short code."""
     chars = string.ascii_letters + string.digits
     return ''.join(random.choice(chars) for _ in range(length))
+
+def generate_sha256_code(url: str) -> str:
+    """Return the first seven hexadecimal characters of a URL's SHA-256 hash."""
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:7]
+
+
+def encode_base62(num: int) -> str:
+    """Encode a non-negative base-10 integer with the Base62 alphabet."""
+    if num < 0:
+        raise ValueError("Base62 encoding requires a non-negative integer")
+    if num == 0:
+        return BASE62_ALPHABET[0]
+
+    encoded = ""
+    while num:
+        num, remainder = divmod(num, len(BASE62_ALPHABET))
+        encoded = BASE62_ALPHABET[remainder] + encoded
+
+    return encoded
+
+
+def generate_counter_code() -> str:
+    """Return the current Base62 counter value and advance the counter."""
+    global GLOBAL_COUNTER
+
+    short_code = encode_base62(GLOBAL_COUNTER)
+    GLOBAL_COUNTER += 1
+    return short_code
+
+
+def generate_short_code(url: str) -> str:
+    """Generate a short code using the configured key-generation strategy."""
+    if STRATEGY == "COUNTER":
+        return generate_counter_code()
+    if STRATEGY == "SHA256":
+        return generate_sha256_code(url)
+    if STRATEGY == "RANDOM":
+        return generate_random_code(url)
+    raise ValueError(f"Unsupported key-generation strategy: {STRATEGY}")
 
 
 @app.get("/")
@@ -94,11 +137,16 @@ def shorten_url(request: ShortenRequest):
                 short_url=f"http://localhost:8000/{short_code}"
             )
 
-    short_code = generate_short_code()
+    short_code = generate_short_code(normalized_url)
 
-    # Ensure uniqueness (re-generate if collision)
+    # Counter codes can be regenerated; a hash collision needs explicit handling.
     while short_code in url_db:
-        short_code = generate_short_code()
+        if STRATEGY == "SHA256":
+            raise HTTPException(
+                status_code=409,
+                detail="Short code collision for a different URL",
+            )
+        short_code = generate_short_code(normalized_url)
 
     url_db[short_code] = normalized_url
     short_url = f"http://localhost:8000/{short_code}"
@@ -121,5 +169,5 @@ def redirect_to_long_url(short_code: str):
 
 # You can launch the script directly using 'python server.py'
 if __name__ == "__main__":
-    print("Launching Stage 2 URL Shortener...")
+    print("Launching Stage 3 URL Shortener...")
     uvicorn.run("server:app", host="127.0.0.1", port=8000, reload=True)

@@ -1,8 +1,19 @@
-from fastapi.testclient import TestClient
+import hashlib
 import re
-import pytest
 
-from server import app, url_db
+import pytest
+from fastapi.testclient import TestClient
+
+import server
+from server import (
+    BASE62_ALPHABET,
+    GLOBAL_COUNTER,
+    app,
+    encode_base62,
+    generate_counter_code,
+    generate_sha256_code,
+    url_db,
+)
 
 client = TestClient(app)
 
@@ -10,8 +21,12 @@ client = TestClient(app)
 @pytest.fixture(autouse=True)
 def clear_url_db():
     url_db.clear()
+    server.STRATEGY = "COUNTER"
+    server.GLOBAL_COUNTER = GLOBAL_COUNTER
     yield
     url_db.clear()
+    server.STRATEGY = "COUNTER"
+    server.GLOBAL_COUNTER = GLOBAL_COUNTER
 
 
 def test_read_root():
@@ -133,3 +148,54 @@ def test_equivalent_normalized_urls_reuse_short_code():
     assert second_response.status_code == 200
     assert second_response.json() == first_response.json()
     assert len(url_db) == 1
+
+
+def test_generate_sha256_code_uses_first_seven_hexadecimal_characters():
+    long_url = "https://example.com/articles"
+
+    short_code = generate_sha256_code(long_url)
+
+    expected_code = hashlib.sha256(long_url.encode("utf-8")).hexdigest()[:7]
+    assert short_code == expected_code
+    assert re.fullmatch(r"[0-9a-f]{7}", short_code)
+
+
+def test_encode_base62_converts_decimal_numbers():
+    assert encode_base62(0) == "0"
+    assert encode_base62(61) == BASE62_ALPHABET[-1]
+    assert encode_base62(62) == "10"
+    assert encode_base62(GLOBAL_COUNTER) == "1000000"
+
+
+def test_generate_counter_code_encodes_and_increments_counter(monkeypatch):
+    monkeypatch.setattr(server, "GLOBAL_COUNTER", GLOBAL_COUNTER)
+
+    first_code = generate_counter_code()
+    second_code = generate_counter_code()
+
+    assert first_code == "1000000"
+    assert second_code == "1000001"
+    assert server.GLOBAL_COUNTER == GLOBAL_COUNTER + 2
+
+
+def test_shorten_uses_counter_strategy_by_default():
+    response = client.post(
+        "/shorten",
+        json={"long_url": "https://example.com/counter"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["short_url"] == "http://localhost:8000/1000000"
+    assert url_db == {"1000000": "https://example.com/counter"}
+
+
+def test_shorten_uses_sha256_strategy(monkeypatch):
+    monkeypatch.setattr(server, "STRATEGY", "SHA256")
+    long_url = "https://example.com/sha256"
+
+    response = client.post("/shorten", json={"long_url": long_url})
+
+    expected_code = generate_sha256_code(long_url)
+    assert response.status_code == 200
+    assert response.json()["short_url"] == f"http://localhost:8000/{expected_code}"
+    assert url_db == {expected_code: long_url}
