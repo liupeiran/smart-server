@@ -1,9 +1,17 @@
 from fastapi.testclient import TestClient
 import re
+import pytest
 
 from server import app, url_db
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def clear_url_db():
+    url_db.clear()
+    yield
+    url_db.clear()
 
 
 def test_read_root():
@@ -14,8 +22,6 @@ def test_read_root():
 
 def test_shorten_url():
     """Test 1: Shorten a URL - should return a valid shortened URL"""
-    url_db.clear()
-    
     response = client.post(
         "/shorten",
         json={"long_url": "https://www.google.com"}
@@ -37,8 +43,6 @@ def test_shorten_url():
 
 def test_redirect_with_valid_short_code():
     """Test 2: Redirect using short code - should return 302 and redirect to long URL"""
-    url_db.clear()
-    
     response = client.post(
         "/shorten",
         json={"long_url": "https://www.example.com"}
@@ -53,8 +57,6 @@ def test_redirect_with_valid_short_code():
 
 def test_invalid_short_code_returns_404():
     """Test 3: Try invalid short code - should return 404 with error message"""
-    url_db.clear()
-    
     response = client.get("/invalid99")
     
     assert response.status_code == 404
@@ -66,8 +68,6 @@ def test_invalid_short_code_returns_404():
 
 def test_multiple_urls_get_unique_codes():
     """Test 4: Multiple URLs - should get unique short codes for each URL"""
-    url_db.clear()
-    
     urls = [
         "https://github.com",
         "https://stackoverflow.com/questions/12345",
@@ -91,3 +91,45 @@ def test_multiple_urls_get_unique_codes():
     
     assert len(short_codes) == 3
     assert len(set(short_codes)) == 3
+
+
+def test_malformed_long_url_returns_400():
+    response = client.post("/shorten", json={"long_url": "not a valid URL"})
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid request"}
+    assert url_db == {}
+
+
+@pytest.mark.parametrize(
+    ("long_url", "expected_url"),
+    [
+        (
+            "\t HTTPS://EXAMPLE.COM:443/a/path///?query=value#fragment \t",
+            "https://example.com/a/path?query=value#fragment",
+        ),
+        (" http://EXAMPLE.COM:80/ ", "http://example.com"),
+    ],
+)
+def test_shorten_normalizes_long_url(long_url, expected_url):
+    response = client.post("/shorten", json={"long_url": long_url})
+
+    assert response.status_code == 200
+    short_code = response.json()["short_url"].rsplit("/", maxsplit=1)[1]
+    assert url_db[short_code] == expected_url
+
+
+def test_equivalent_normalized_urls_reuse_short_code():
+    first_response = client.post(
+        "/shorten",
+        json={"long_url": "https://EXAMPLE.COM:443/articles/"},
+    )
+    second_response = client.post(
+        "/shorten",
+        json={"long_url": " https://example.com/articles "},
+    )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert second_response.json() == first_response.json()
+    assert len(url_db) == 1
