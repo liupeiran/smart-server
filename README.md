@@ -35,6 +35,10 @@ pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
+```bash
+uvicorn server:app --reload
+```
+
 The server will be available at http://localhost:8000. The root endpoint (`GET /`) returns:
 
 ```json
