@@ -9,6 +9,19 @@ A basic HTTP server built with Python 3 and FastAPI that returns "Hello World".
 - Uvicorn
 
 ## Setup
+```
+PROMPT="%1d %1v> "
+```
+
+Create an environment
+```
+python3 -m venv venv
+```
+
+Python env activate
+```
+source venv/bin/activate
+```
 
 Install dependencies:
 
