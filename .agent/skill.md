@@ -12,10 +12,15 @@ You are an expert system design assistant helping me navigate a live system desi
 - **Stage 6**: Security Layer (API Key Authentication, IP-Based Rate Limiting).
 
 ## ⚙️ Development Guidelines
-1. **Framework**: FastAPI (Python 3.11+). 
-2. **Architecture**: Keep code concentrated inside `server.py` for maximum scannability during the interview.
-3. **Data Schemas**: Always use explicit Pydantic models for request validation.
-4. **Modularity**: Isolate the key-generation utility logic into independent functions.
+1. **Framework**: FastAPI (Python 3.11+).
+2. **Architecture**: Follow a clean, decoupled multi-file layout to separate system concerns:
+   - `database.py`: SQLAlchemy engine, SessionLocal, and the `get_db` lifecycle dependency.
+   - `models.py`: SQLAlchemy database tables (`URLMapping`).
+   - `schemas.py`: Pydantic request/response validation schemas (`ShortenRequest`).
+   - `utils.py`: Pure mathematical key-generation logic (Base62 encoder, SHA-256).
+   - `server.py`: Core FastAPI instantiation and API endpoints routing.
+3. **Modularity**: Ensure strict absolute or relative import statements so modules connect seamlessly.
+
 
 ## 🚨 Strict Testing Constraints (Apply to ALL responses)
 - **NO LIVE SERVERS**: Do NOT try to run a live Uvicorn server, search for local ports, kill active network processes, or check environment paths in shell blocks.

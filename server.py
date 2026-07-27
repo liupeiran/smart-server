@@ -6,9 +6,10 @@ from urllib.parse import urlsplit, urlunsplit
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
+from redis import Redis
 from sqlalchemy.orm import Session
 
-from database import Base, engine, get_db
+from database import Base, engine, get_db, get_redis
 from models import URLMapping
 from schemas import ShortenRequest, ShortenResponse
 from utils import encode_base62, generate_sha256_code
@@ -22,6 +23,8 @@ app = FastAPI(
 
 STRATEGY = "COUNTER"
 GLOBAL_COUNTER = 62**6
+CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
+CACHE_KEY_PREFIX = "url:"
 
 
 @app.exception_handler(RequestValidationError)
@@ -85,6 +88,10 @@ def generate_short_code(url: str) -> str:
     raise ValueError(f"Unsupported key-generation strategy: {STRATEGY}")
 
 
+def cache_key(short_code: str) -> str:
+    return f"{CACHE_KEY_PREFIX}{short_code}"
+
+
 @app.get("/")
 def read_root() -> dict[str, str]:
     return {"message": "Hello World"}
@@ -140,7 +147,12 @@ def shorten_url(
 def redirect_to_long_url(
     short_code: str,
     db: Session = Depends(get_db),
+    redis: Redis = Depends(get_redis),
 ) -> RedirectResponse:
+    cached_long_url = redis.get(cache_key(short_code))
+    if cached_long_url is not None:
+        return RedirectResponse(url=cached_long_url, status_code=302)
+
     url_mapping = (
         db.query(URLMapping)
         .filter(URLMapping.short_code == short_code)
@@ -152,4 +164,9 @@ def redirect_to_long_url(
             detail=f"Short code '{short_code}' not found",
         )
 
+    redis.set(
+        cache_key(short_code),
+        url_mapping.long_url,
+        ex=CACHE_TTL_SECONDS,
+    )
     return RedirectResponse(url=url_mapping.long_url, status_code=302)

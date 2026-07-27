@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 import server
-from database import Base, get_db
+from database import Base, get_db, get_redis
 from models import URLMapping
 from server import (
     GLOBAL_COUNTER,
@@ -20,6 +20,31 @@ from utils import (
     encode_base62,
     generate_sha256_code,
 )
+
+
+class InMemoryRedis:
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+        self.expirations: dict[str, int] = {}
+
+    def get(self, key: str) -> str | None:
+        return self.values.get(key)
+
+    def set(self, key: str, value: str, ex: int) -> bool:
+        self.values[key] = value
+        self.expirations[key] = ex
+        return True
+
+    def clear(self) -> None:
+        self.values.clear()
+        self.expirations.clear()
+
+
+test_redis = InMemoryRedis()
+
+
+def override_get_redis() -> InMemoryRedis:
+    return test_redis
 
 
 test_engine = create_engine(
@@ -43,6 +68,7 @@ def override_get_db():
 
 
 app.dependency_overrides[get_db] = override_get_db
+app.dependency_overrides[get_redis] = override_get_redis
 client = TestClient(app)
 
 
@@ -50,6 +76,7 @@ client = TestClient(app)
 def reset_database():
     Base.metadata.drop_all(bind=test_engine)
     Base.metadata.create_all(bind=test_engine)
+    test_redis.clear()
     yield
     Base.metadata.drop_all(bind=test_engine)
 
@@ -105,6 +132,7 @@ def override_get_db():
 
 
 app.dependency_overrides[get_db] = override_get_db
+app.dependency_overrides[get_redis] = override_get_redis
 
 
 def get_mapping(short_code: str) -> URLMapping | None:
@@ -120,10 +148,12 @@ def get_mapping(short_code: str) -> URLMapping | None:
 def reset_database():
     Base.metadata.drop_all(bind=test_engine)
     Base.metadata.create_all(bind=test_engine)
+    test_redis.clear()
     server.STRATEGY = "COUNTER"
     server.GLOBAL_COUNTER = GLOBAL_COUNTER
     yield
     Base.metadata.drop_all(bind=test_engine)
+    test_redis.clear()
     server.STRATEGY = "COUNTER"
     server.GLOBAL_COUNTER = GLOBAL_COUNTER
 
@@ -309,3 +339,50 @@ def test_shorten_uses_sha256_strategy(monkeypatch):
     mapping = get_mapping(expected_code)
     assert mapping is not None
     assert mapping.long_url == long_url
+
+
+def test_shorten_uses_write_around_without_populating_cache():
+    response = client.post(
+        "/shorten",
+        json={"long_url": "https://example.com/write-around"},
+    )
+    short_code = response.json()["short_url"].rsplit("/", maxsplit=1)[1]
+
+    assert response.status_code == 200
+    assert test_redis.values == {}
+    assert test_redis.expirations == {}
+    assert server.cache_key(short_code) not in test_redis.values
+
+
+def test_redirect_populates_cache_with_30_day_ttl():
+    shorten_response = client.post(
+        "/shorten",
+        json={"long_url": "https://example.com/cache-aside"},
+    )
+    short_code = shorten_response.json()["short_url"].rsplit("/", maxsplit=1)[1]
+
+    response = client.get(f"/{short_code}", follow_redirects=False)
+
+    assert response.status_code == 302
+    assert test_redis.values[server.cache_key(short_code)] == (
+        "https://example.com/cache-aside"
+    )
+    assert test_redis.expirations[server.cache_key(short_code)] == 30 * 24 * 60 * 60
+
+
+def test_redirect_uses_cached_url_when_database_mapping_is_missing():
+    shorten_response = client.post(
+        "/shorten",
+        json={"long_url": "https://example.com/cache-hit"},
+    )
+    short_code = shorten_response.json()["short_url"].rsplit("/", maxsplit=1)[1]
+    client.get(f"/{short_code}", follow_redirects=False)
+
+    with TestSessionLocal() as db:
+        db.query(URLMapping).filter(URLMapping.short_code == short_code).delete()
+        db.commit()
+
+    response = client.get(f"/{short_code}", follow_redirects=False)
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "https://example.com/cache-hit"
