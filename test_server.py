@@ -3,28 +3,127 @@ import re
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 import server
+from database import Base, get_db
+from models import URLMapping
 from server import (
-    BASE62_ALPHABET,
     GLOBAL_COUNTER,
     app,
-    encode_base62,
     generate_counter_code,
+)
+from utils import (
+    BASE62_ALPHABET,
+    encode_base62,
     generate_sha256_code,
-    url_db,
 )
 
+
+test_engine = create_engine(
+    "sqlite:///:memory:",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+TestSessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=test_engine,
+)
+
+
+def override_get_db():
+    db = TestSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+app.dependency_overrides[get_db] = override_get_db
 client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
-def clear_url_db():
-    url_db.clear()
+def reset_database():
+    Base.metadata.drop_all(bind=test_engine)
+    Base.metadata.create_all(bind=test_engine)
+    yield
+    Base.metadata.drop_all(bind=test_engine)
+
+
+def test_shorten_persists_url_mapping():
+    response = client.post(
+        "/shorten",
+        json={"long_url": "https://example.com/articles"},
+    )
+
+    assert response.status_code == 200
+    short_code = response.json()["short_url"].rsplit("/", maxsplit=1)[1]
+
+    with TestSessionLocal() as db:
+        mapping = (
+            db.query(URLMapping)
+            .filter(URLMapping.short_code == short_code)
+            .first()
+        )
+
+        assert mapping is not None
+        assert mapping.long_url == "https://example.com/articles"
+        assert mapping.short_code == short_code
+
+
+def test_short_code_redirects_to_persisted_url():
+    shorten_response = client.post(
+        "/shorten",
+        json={"long_url": "https://example.com/articles"},
+    )
+    short_code = shorten_response.json()["short_url"].rsplit("/", maxsplit=1)[1]
+
+    response = client.get(f"/{short_code}", follow_redirects=False)
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "https://example.com/articles"
+
+client = TestClient(app)
+test_engine = create_engine(
+    "sqlite://",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+
+
+def override_get_db():
+    db = TestSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+app.dependency_overrides[get_db] = override_get_db
+
+
+def get_mapping(short_code: str) -> URLMapping | None:
+    with TestSessionLocal() as db:
+        return (
+            db.query(URLMapping)
+            .filter(URLMapping.short_code == short_code)
+            .first()
+        )
+
+
+@pytest.fixture(autouse=True)
+def reset_database():
+    Base.metadata.drop_all(bind=test_engine)
+    Base.metadata.create_all(bind=test_engine)
     server.STRATEGY = "COUNTER"
     server.GLOBAL_COUNTER = GLOBAL_COUNTER
     yield
-    url_db.clear()
+    Base.metadata.drop_all(bind=test_engine)
     server.STRATEGY = "COUNTER"
     server.GLOBAL_COUNTER = GLOBAL_COUNTER
 
@@ -49,11 +148,12 @@ def test_shorten_url():
     assert data["short_url"].startswith("http://localhost:8000/")
     
     short_code = data["short_url"].split("/")[-1]
-    assert len(short_code) == 7
-    assert re.match(r'^[a-zA-Z0-9]{7}$', short_code)
-    
-    assert short_code in url_db
-    assert url_db[short_code] == "https://www.google.com"
+    assert re.match(r"^[a-zA-Z0-9]+$", short_code)
+
+    mapping = get_mapping(short_code)
+    assert mapping is not None
+    assert mapping.long_url == "https://www.google.com"
+    assert short_code == encode_base62(mapping.id)
 
 
 def test_redirect_with_valid_short_code():
@@ -98,11 +198,12 @@ def test_multiple_urls_get_unique_codes():
         short_url = response.json()["short_url"]
         short_code = short_url.split("/")[-1]
         
-        assert len(short_code) == 7
         assert short_code not in short_codes
         
         short_codes.append(short_code)
-        assert url_db[short_code] == url
+        mapping = get_mapping(short_code)
+        assert mapping is not None
+        assert mapping.long_url == url
     
     assert len(short_codes) == 3
     assert len(set(short_codes)) == 3
@@ -113,7 +214,8 @@ def test_malformed_long_url_returns_400():
 
     assert response.status_code == 400
     assert response.json() == {"detail": "Invalid request"}
-    assert url_db == {}
+    with TestSessionLocal() as db:
+        assert db.query(URLMapping).count() == 0
 
 
 @pytest.mark.parametrize(
@@ -131,7 +233,9 @@ def test_shorten_normalizes_long_url(long_url, expected_url):
 
     assert response.status_code == 200
     short_code = response.json()["short_url"].rsplit("/", maxsplit=1)[1]
-    assert url_db[short_code] == expected_url
+    mapping = get_mapping(short_code)
+    assert mapping is not None
+    assert mapping.long_url == expected_url
 
 
 def test_equivalent_normalized_urls_reuse_short_code():
@@ -147,7 +251,8 @@ def test_equivalent_normalized_urls_reuse_short_code():
     assert first_response.status_code == 200
     assert second_response.status_code == 200
     assert second_response.json() == first_response.json()
-    assert len(url_db) == 1
+    with TestSessionLocal() as db:
+        assert db.query(URLMapping).count() == 1
 
 
 def test_generate_sha256_code_uses_first_seven_hexadecimal_characters():
@@ -185,8 +290,11 @@ def test_shorten_uses_counter_strategy_by_default():
     )
 
     assert response.status_code == 200
-    assert response.json()["short_url"] == "http://localhost:8000/1000000"
-    assert url_db == {"1000000": "https://example.com/counter"}
+    assert response.json()["short_url"] == "http://localhost:8000/1"
+    mapping = get_mapping("1")
+    assert mapping is not None
+    assert mapping.id == 1
+    assert mapping.long_url == "https://example.com/counter"
 
 
 def test_shorten_uses_sha256_strategy(monkeypatch):
@@ -198,4 +306,6 @@ def test_shorten_uses_sha256_strategy(monkeypatch):
     expected_code = generate_sha256_code(long_url)
     assert response.status_code == 200
     assert response.json()["short_url"] == f"http://localhost:8000/{expected_code}"
-    assert url_db == {expected_code: long_url}
+    mapping = get_mapping(expected_code)
+    assert mapping is not None
+    assert mapping.long_url == long_url

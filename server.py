@@ -1,40 +1,27 @@
+# main.py
 import random
 import string
-import hashlib
 from urllib.parse import urlsplit, urlunsplit
 
-import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel, HttpUrl, field_validator
+from sqlalchemy.orm import Session
+
+from database import Base, engine, get_db
+from models import URLMapping
+from schemas import ShortenRequest, ShortenResponse
+from utils import encode_base62, generate_sha256_code
+
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="URL Shortener",
-    description="A MVP evolving URL shortener system"
+    description="A MVP evolving URL shortener system",
 )
 
 STRATEGY = "COUNTER"
 GLOBAL_COUNTER = 62**6
-BASE62_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-# In-memory database
-url_db = {}
-
-
-class ShortenRequest(BaseModel):
-    long_url: HttpUrl
-
-    @field_validator("long_url", mode="before")
-    @classmethod
-    def trim_long_url(cls, value: object) -> object:
-        if isinstance(value, str):
-            return value.strip()
-        return value
-
-
-class ShortenResponse(BaseModel):
-    short_url: str
 
 
 @app.exception_handler(RequestValidationError)
@@ -45,7 +32,6 @@ async def invalid_request_handler(
 
 
 def normalize_url(url: str) -> str:
-    """Return the canonical representation used for storage and lookup."""
     parsed = urlsplit(url.strip())
     hostname = (parsed.hostname or "").lower()
 
@@ -64,45 +50,24 @@ def normalize_url(url: str) -> str:
         parsed.scheme == "https" and port == 443
     )
     port_suffix = "" if port is None or is_default_port else f":{port}"
-    path = parsed.path.rstrip("/")
 
     return urlunsplit(
         (
             parsed.scheme.lower(),
             f"{userinfo}{hostname}{port_suffix}",
-            path,
+            parsed.path.rstrip("/"),
             parsed.query,
             parsed.fragment,
         )
     )
 
+
 def generate_random_code(length: int = 7) -> str:
-    """Generate a random alphanumeric short code."""
     chars = string.ascii_letters + string.digits
-    return ''.join(random.choice(chars) for _ in range(length))
-
-def generate_sha256_code(url: str) -> str:
-    """Return the first seven hexadecimal characters of a URL's SHA-256 hash."""
-    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:7]
-
-
-def encode_base62(num: int) -> str:
-    """Encode a non-negative base-10 integer with the Base62 alphabet."""
-    if num < 0:
-        raise ValueError("Base62 encoding requires a non-negative integer")
-    if num == 0:
-        return BASE62_ALPHABET[0]
-
-    encoded = ""
-    while num:
-        num, remainder = divmod(num, len(BASE62_ALPHABET))
-        encoded = BASE62_ALPHABET[remainder] + encoded
-
-    return encoded
+    return "".join(random.choice(chars) for _ in range(length))
 
 
 def generate_counter_code() -> str:
-    """Return the current Base62 counter value and advance the counter."""
     global GLOBAL_COUNTER
 
     short_code = encode_base62(GLOBAL_COUNTER)
@@ -111,63 +76,80 @@ def generate_counter_code() -> str:
 
 
 def generate_short_code(url: str) -> str:
-    """Generate a short code using the configured key-generation strategy."""
     if STRATEGY == "COUNTER":
         return generate_counter_code()
     if STRATEGY == "SHA256":
         return generate_sha256_code(url)
     if STRATEGY == "RANDOM":
-        return generate_random_code(url)
+        return generate_random_code()
     raise ValueError(f"Unsupported key-generation strategy: {STRATEGY}")
 
 
 @app.get("/")
-def read_root():
+def read_root() -> dict[str, str]:
     return {"message": "Hello World"}
 
 
 @app.post("/shorten", response_model=ShortenResponse)
-def shorten_url(request: ShortenRequest):
-    """Create a shortened URL from a long URL."""
+def shorten_url(
+    request: ShortenRequest,
+    db: Session = Depends(get_db),
+) -> ShortenResponse:
     normalized_url = normalize_url(str(request.long_url))
 
-    for short_code, stored_url in url_db.items():
-        if stored_url == normalized_url:
-            return ShortenResponse(
-                short_url=f"http://localhost:8000/{short_code}"
-            )
+    existing_mapping = (
+        db.query(URLMapping)
+        .filter(URLMapping.long_url == normalized_url)
+        .first()
+    )
+    if existing_mapping is not None:
+        return ShortenResponse(
+            short_url=f"http://localhost:8000/{existing_mapping.short_code}"
+        )
 
-    short_code = generate_short_code(normalized_url)
+    url_mapping = URLMapping(long_url=normalized_url)
+    db.add(url_mapping)
 
-    # Counter codes can be regenerated; a hash collision needs explicit handling.
-    while short_code in url_db:
-        if STRATEGY == "SHA256":
-            raise HTTPException(
-                status_code=409,
-                detail="Short code collision for a different URL",
-            )
+    if STRATEGY == "COUNTER":
+        db.flush()
+        assert url_mapping.id is not None
+        short_code = encode_base62(url_mapping.id)
+    else:
         short_code = generate_short_code(normalized_url)
 
-    url_db[short_code] = normalized_url
-    short_url = f"http://localhost:8000/{short_code}"
+        while (
+            db.query(URLMapping)
+            .filter(URLMapping.short_code == short_code)
+            .first()
+            is not None
+        ):
+            if STRATEGY == "SHA256":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Short code collision for a different URL",
+                )
+            short_code = generate_short_code(normalized_url)
 
-    return ShortenResponse(short_url=short_url)
+    url_mapping.short_code = short_code
+    db.commit()
+
+    return ShortenResponse(short_url=f"http://localhost:8000/{short_code}")
 
 
 @app.get("/{short_code}")
-def redirect_to_long_url(short_code: str):
-    """Redirect to the original long URL using the short code."""
-    if short_code not in url_db:
+def redirect_to_long_url(
+    short_code: str,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    url_mapping = (
+        db.query(URLMapping)
+        .filter(URLMapping.short_code == short_code)
+        .first()
+    )
+    if url_mapping is None:
         raise HTTPException(
             status_code=404,
-            detail=f"Short code '{short_code}' not found"
+            detail=f"Short code '{short_code}' not found",
         )
-    
-    long_url = url_db[short_code]
-    return RedirectResponse(url=long_url, status_code=302)
 
-
-# You can launch the script directly using 'python server.py'
-if __name__ == "__main__":
-    print("Launching Stage 3 URL Shortener...")
-    uvicorn.run("server:app", host="127.0.0.1", port=8000, reload=True)
+    return RedirectResponse(url=url_mapping.long_url, status_code=302)
