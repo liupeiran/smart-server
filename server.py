@@ -14,7 +14,12 @@ from models import URLMapping
 from schemas import ShortenRequest, ShortenResponse
 from utils import encode_base62, generate_sha256_code
 
-Base.metadata.create_all(bind=engine)
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    # Clean up operations can go here if needed
 
 app = FastAPI(
     title="URL Shortener",
@@ -170,3 +175,6 @@ def redirect_to_long_url(
         ex=CACHE_TTL_SECONDS,
     )
     return RedirectResponse(url=url_mapping.long_url, status_code=302)
+
+print("⚡ FORCING IMMEDIATE TABLE CREATION VIA CODE ROOT LEVEL...")
+Base.metadata.create_all(bind=engine)

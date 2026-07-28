@@ -3,9 +3,11 @@ import re
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy import BigInteger
 
 import server
 from database import Base, get_db, get_redis
@@ -46,6 +48,11 @@ test_redis = InMemoryRedis()
 def override_get_redis() -> InMemoryRedis:
     return test_redis
 
+# Compiler Hook: Forces SQLite to treat BigInteger as an auto-incrementing type
+@compiles(BigInteger, "sqlite")
+def compile_bigint_sqlite(element, compiler, **kw):
+    return "INTEGER"
+
 
 test_engine = create_engine(
     "sqlite:///:memory:",
@@ -76,6 +83,12 @@ client = TestClient(app)
 def reset_database():
     Base.metadata.drop_all(bind=test_engine)
     Base.metadata.create_all(bind=test_engine)
+    with test_engine.connect() as conn:
+        conn.execute(
+            text("INSERT OR REPLACE INTO sqlite_sequence (name, seq) VALUES ('url_mappings', :start_id)"),
+            {"start_id": 62**6 - 1}
+        )
+        conn.commit()
     test_redis.clear()
     yield
     Base.metadata.drop_all(bind=test_engine)
@@ -116,7 +129,7 @@ def test_short_code_redirects_to_persisted_url():
 
 client = TestClient(app)
 test_engine = create_engine(
-    "sqlite://",
+    "sqlite:///:memory:",
     connect_args={"check_same_thread": False},
     poolclass=StaticPool,
 )
